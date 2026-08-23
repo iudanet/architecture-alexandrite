@@ -1,0 +1,56 @@
+@startuml seq-orders-cache
+title Чтение списка заказов и запись смены статуса с кешированием
+
+skinparam sequenceMessageAlign direction
+skinparam maxMessageSize 220
+
+actor "Оператор" as op
+participant "MES\n(React)" as ui
+participant "MES API\n(C#)" as api
+database "Redis\n(кеш)" as cache
+database "MES db\n(PostgreSQL)" as db
+queue "RabbitMQ" as mq
+
+== Чтение списка заказов (Cache-Aside) ==
+
+op -> ui : Открывает дашборд
+ui -> api : GET /orders?status=MANUFACTURING_APPROVED&page=1
+api -> cache : GET orders:status=MANUFACTURING_APPROVED:page=1
+alt Данные в кеше (попадание)
+  cache --> api : Список заказов
+  api --> ui : 200 OK
+else Данных нет (промах)
+  cache --> api : nil
+  api -> db : SELECT заказы по статусу с пагинацией
+  db --> api : Результат
+  api -> cache : SET orders:status=MANUFACTURING_APPROVED:page=1, TTL 30 с
+  api --> ui : 200 OK
+end
+ui --> op : Список заказов
+
+== Запись: смена статуса заказа ==
+
+op -> ui : Взять заказ в работу
+ui -> api : POST /orders/{id}/status\nMANUFACTURING_STARTED
+api -> db : UPDATE статус заказа
+db --> api : Успех
+note right of api : Инвалидация после успешной записи,\nне до неё: иначе кеш будет очищен\nпри неудачной транзакции
+api -> cache : DEL списков статусов A и B\n(ключи собираются по индексу тегов)
+api -> cache : DEL order:{id}
+api -> mq : Событие смены статуса
+api --> ui : 200 OK
+ui --> op : Заказ в работе
+
+== Расчёт стоимости: кеш по содержимому модели ==
+
+api -> cache : GET price:model_hash
+alt Модель уже считалась
+  cache --> api : Стоимость
+  note right of api : Расчёт 2-30 минут не выполняется\nповторно для той же модели
+else Новая модель
+  cache --> api : nil
+  api -> api : Расчёт стоимости
+  api -> cache : SET price:model_hash, TTL 30 дней
+end
+
+@enduml
